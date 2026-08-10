@@ -15,9 +15,9 @@ def get_process_memory_mb() -> float:
     process = psutil.Process(os.getpid())
     return process.memory_info().rss / (1024 * 1024)
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------
 # 1. Naive Brute-Force Off-Target Matcher O(N * M)
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------
 def run_brute_force_matcher(genome: str, query: str, max_mismatches: int) -> List[Tuple[int, int]]:
     """
     Linearly steps through the genome text character-by-character to find 
