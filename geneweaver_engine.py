@@ -5,17 +5,24 @@ import numpy as np
 from typing import List, Tuple
 
 # Try importing Numba CUDA safely for environments without GPU support
+cuda = None
+_NUMBA_CUDA_IMPORT_ERROR = None
 try:
-    import numba
-    from numba import cuda
-    _NUMBA_CUDA_IMPORT_ERROR = None
+    # Import numba and attempt to access its cuda submodule. Some installs
+    # include numba without CUDA support, so guard this separately.
+    import numba  # noqa: F401
+    try:
+        from numba import cuda
+    except Exception as sub_err:
+        cuda = None
+        _NUMBA_CUDA_IMPORT_ERROR = sub_err
 except Exception as err:
     cuda = None
     _NUMBA_CUDA_IMPORT_ERROR = err
 
-# =========================================================================
+# =======================================================================
 # Hyperparameters & Global Configuration
-# =========================================================================
+# =======================================================================
 GENOME_SIZE_SIMULATION = 5_000_000  # 5 Million Base Pairs
 TARGET_SGRNA = "GAGTCCGAGCAGAAGAAGAA"  # 20-bp guide RNA
 PAM_PATTERN = "AGG"                     # 3-bp PAM site (NGG)
