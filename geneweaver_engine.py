@@ -20,9 +20,9 @@ except Exception as err:
     cuda = None
     _NUMBA_CUDA_IMPORT_ERROR = err
 
-# =======================================================================
+# =====================================================================
 # Hyperparameters & Global Configuration
-# =======================================================================
+# =====================================================================
 GENOME_SIZE_SIMULATION = 5_000_000  # 5 Million Base Pairs
 TARGET_SGRNA = "GAGTCCGAGCAGAAGAAGAA"  # 20-bp guide RNA
 PAM_PATTERN = "AGG"                     # 3-bp PAM site (NGG)
