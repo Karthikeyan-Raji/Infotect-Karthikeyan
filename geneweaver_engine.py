@@ -111,9 +111,9 @@ def unpack_2bit_window(packed_arr: np.ndarray, byte_idx: int, nucleotide_len: in
     return ''.join(chars)
 
 
-# ========================================================================
+# =======================================================================
 # 1. CPU Alignment Algorithms (Baseline Implementations
-# ========================================================================
+# =======================================================================
 def run_brute_force_matcher(genome: str, query: str, max_mismatches: int) -> List[Tuple[int, int]]:
     """Linear character-by-character CPU sliding window matcher O(N * M)."""
     n = len(genome)
