@@ -41,9 +41,9 @@ NUC_BIT_MAP[ord('T')] = 0b11
 BIT_TO_NUC = {0b00: 'A', 0b01: 'C', 0b10: 'G', 0b11: 'T'}
 
 
-# =========================================================================
+# ====================================================================
 # System Diagnostic & Utility Functions
-# =========================================================================
+# ====================================================================
 def get_process_memory_mb() -> float:
     """Returns current process Resident Set Size (RSS) memory in MB."""
     process = psutil.Process(os.getpid())
@@ -81,9 +81,9 @@ def generate_synthetic_dna(length: int) -> str:
     return "".join(np.random.choice(bases, size=length))
 
 
-# =========================================================================
+# ====================================================================
 # Bit-Packing Utilities (4x Compression Ratio)
-# =========================================================================
+# ====================================================================
 def pack_dna_sequence(dna_str: str) -> np.ndarray:
     """Packs ASCII DNA text into a 2-bit uint8 NumPy array (4 bases per byte)."""
     ascii_bytes = np.frombuffer(dna_str.upper().encode('ascii'), dtype=np.uint8)
