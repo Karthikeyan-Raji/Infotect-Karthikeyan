@@ -4,7 +4,7 @@ import psutil
 import numpy as np
 from typing import List, Tuple
 
-# Try importing Numba CUDA safely for environments without GPU support
+# Try importing Numba CUDA safely for environments without GPU
 cuda = None
 _NUMBA_CUDA_IMPORT_ERROR = None
 try:
