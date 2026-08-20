@@ -8,11 +8,11 @@ from typing import List, Tuple
 cuda = None
 _NUMBA_CUDA_IMPORT_ERROR = None
 try:
-    # Import numba and attempt to access its cuda submodule. Some installs
+    # Import numba and attempt to access its cuda submodule.
     # include numba without CUDA support, so guard this separately.
     import numba  # noqa: F401
     try:
-        from numba import cuda
+        from numba import cud
     except Exception as sub_err:
         cuda = None
         _NUMBA_CUDA_IMPORT_ERROR = sub_err
