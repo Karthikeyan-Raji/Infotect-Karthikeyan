@@ -20,7 +20,6 @@ except Exception as err:
     cuda = None
     _NUMBA_CUDA_IMPORT_ERROR = err
 
-# =====================================================================
 # Hyperparameters & Global Configuration
 # =====================================================================
 GENOME_SIZE_SIMULATION = 5_000_000  # 5 Million Base Pairs
