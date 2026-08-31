@@ -316,9 +316,6 @@ def run_gpu_alignment(genome_str: str, target_sgrna_str: str, max_mismatch: int 
         'd2h_time': d2h_time,
         'total_gpu_time': h2d_time + kernel_time + d2h_time,
     }
-
-
-# =========================================================================
 # Execution Main Method & Benchmarking Harness
 # =========================================================================
 if __name__ == '__main__':
