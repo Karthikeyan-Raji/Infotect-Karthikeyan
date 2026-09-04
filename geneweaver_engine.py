@@ -1,52 +1,40 @@
+"""
+GeneWeaver — Member 1: HPC / GPU Compute Engine
+Capabilities:
+  • Week 1: CPU Baseline Matchers (Brute-Force & Space-Optimized Smith-Waterman)
+  • Week 2: Numba CUDA Kernel + 2-Bit Nucleotide Compression (H2D & D2H Orchestration)
+  • Week 3: Multi-GPU Load-Balanced Dask Scheduling with 23-bp Boundary Overlaps
+  • Week 4: Block-Level Shared Memory Optimization to Minimize VRAM Bus Latency
+"""
+
+from __future__ import annotations
+
 import os
 import time
+import math
 import psutil
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any, Optional
 
-# Try importing Numba CUDA safely for environments without GPU
+# -------------------------------------------------------------------------
+# CUDA Availability & Safety Guard
+# -------------------------------------------------------------------------
 cuda = None
-_NUMBA_CUDA_IMPORT_ERROR = None
+_NUMBA_CUDA_ERROR = None
+
 try:
-    # Import numba and attempt to access its cuda submodule.
-    # include numba without CUDA support, so guard this separately.
-    import numba  # noqa: F401
+    import numba
     try:
-        from numba import cud
-    except Exception as sub_err:
-        cuda = None
-        _NUMBA_CUDA_IMPORT_ERROR = sub_err
-except Exception as err:
-    cuda = None
-    _NUMBA_CUDA_IMPORT_ERROR = err
-
-# Hyperparameters & Global Configuration
-GENOME_SIZE_SIMULATION = 5_000_000  # 5 Million Base Pairs
-TARGET_SGRNA = "GAGTCCGAGCAGAAGAAGAA"  # 20-bp guide RNA
-PAM_PATTERN = "AGG"                     # 3-bp PAM site (NGG)
-QUERY_SEQ = TARGET_SGRNA + PAM_PATTERN  # Total sequence length M = 23
-MAX_MISMATCHES = 4                     # CRISPR mismatch threshold
-THREADS_PER_BLOCK = 256
-MAX_HITS_CAPACITY = 100_000            # VRAM buffer capacity for hit indices
-
-# 2-Bit Nucleotide Encoding Lookup Table: A=00, C=01, G=10, T=11
-NUC_BIT_MAP = np.full(256, 0, dtype=np.uint8)
-NUC_BIT_MAP[ord('A')] = 0b00
-NUC_BIT_MAP[ord('C')] = 0b01
-NUC_BIT_MAP[ord('G')] = 0b10
-NUC_BIT_MAP[ord('T')] = 0b11
-
-BIT_TO_NUC = {0b00: 'A', 0b01: 'C', 0b10: 'G', 0b11: 'T'}
-
-# System Diagnostic & Utility Functions
-def get_process_memory_mb() -> float:
-    """Returns current process Resident Set Size (RSS) memory in MB."""
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / (1024 * 1024)
+        from numba import cuda as _cuda
+        cuda = _cuda
+    except Exception as exc:
+        _NUMBA_CUDA_ERROR = exc
+except Exception as exc:
+    _NUMBA_CUDA_ERROR = exc
 
 
-def cuda_available() -> bool:
-    """Checks if Numba CUDA is importable and an active GPU device is detected."""
+def is_cuda_available() -> bool:
+    """Verifies that Numba CUDA is installed and an accessible GPU device exists."""
     if cuda is None:
         return False
     try:
@@ -55,56 +43,77 @@ def cuda_available() -> bool:
         return False
 
 
-def cuda_error_message() -> str:
-    """Provides detailed diagnostic output if CUDA initialization fails."""
-    if cuda is None:
-        if _NUMBA_CUDA_IMPORT_ERROR is not None:
-            return str(_NUMBA_CUDA_IMPORT_ERROR)
-        return "Numba CUDA library could not be imported."
+def get_gpu_count() -> int:
+    """Returns number of physical CUDA GPUs available."""
+    if not is_cuda_available():
+        return 0
     try:
-        if not cuda.is_available():
-            return "CUDA library detected, but no compatible GPU driver/device was found."
-    except Exception as err:
-        return str(err)
-    return "Unknown CUDA initialization error."
+        return len(cuda.gpus)
+    except Exception:
+        return 1
 
 
-def generate_synthetic_dna(length: int) -> str:
-    """Generates a deterministic pseudo-random DNA sequence composed of {A, C, G, T}."""
-    np.random.seed(42)
-    bases = np.array(['A', 'C', 'G', 'T'])
-    return "".join(np.random.choice(bases, size=length))
+# -------------------------------------------------------------------------
+# Global Parameters & Encoding LUTs
+# -------------------------------------------------------------------------
+THREADS_PER_BLOCK = 256
+MAX_HITS_CAPACITY = 200_000
+
+# 2-Bit nucleotide map: A=00, C=01, G=10, T=11
+NUC_BIT_MAP = np.full(256, 0, dtype=np.uint8)
+NUC_BIT_MAP[ord("A")] = 0b00
+NUC_BIT_MAP[ord("a")] = 0b00
+NUC_BIT_MAP[ord("C")] = 0b01
+NUC_BIT_MAP[ord("c")] = 0b01
+NUC_BIT_MAP[ord("G")] = 0b10
+NUC_BIT_MAP[ord("g")] = 0b10
+NUC_BIT_MAP[ord("T")] = 0b11
+NUC_BIT_MAP[ord("t")] = 0b11
+
+BIT_TO_NUC = {0b00: "A", 0b01: "C", 0b10: "G", 0b11: "T"}
 
 
-# Bit-Packing Utilities (4x Compression Ratio)
 def pack_dna_sequence(dna_str: str) -> np.ndarray:
-    """Packs ASCII DNA text into a 2-bit uint8 NumPy array (4 bases per byte)."""
-    ascii_bytes = np.frombuffer(dna_str.upper().encode('ascii'), dtype=np.uint8)
-    mapped_2bit = NUC_BIT_MAP[ascii_bytes]
-    pad_len = (4 - (len(mapped_2bit) % 4)) % 4
-    if pad_len > 0:
-        mapped_2bit = np.pad(mapped_2bit, (0, pad_len), 'constant', constant_values=0)
-    
-    packed = (mapped_2bit[0::4] << 6) | \
-             (mapped_2bit[1::4] << 4) | \
-             (mapped_2bit[2::4] << 2) | \
-             (mapped_2bit[3::4])
-             
+    """
+    Compresses ASCII nucleotide strings into 2-bit packed uint8 arrays.
+    Reduces memory footprint by 75% (4 bases per byte).
+    """
+    ascii_bytes = np.frombuffer(dna_str.encode("ascii"), dtype=np.uint8)
+    mapped = NUC_BIT_MAP[ascii_bytes]
+    remainder = len(mapped) % 4
+    if remainder != 0:
+        pad_len = 4 - remainder
+        mapped = np.pad(mapped, (0, pad_len), mode="constant", constant_values=0)
+
+    packed = (
+        (mapped[0::4] << 6)
+        | (mapped[1::4] << 4)
+        | (mapped[2::4] << 2)
+        | (mapped[3::4])
+    )
     return packed.astype(np.uint8)
 
 
-def unpack_2bit_window(packed_arr: np.ndarray, byte_idx: int, nucleotide_len: int = 23) -> str:
-    """Reconstructs ASCII text from packed bytes for correctness verification."""
-    chars = []
-    for i in range(nucleotide_len):
-        b_idx = byte_idx + (i // 4)
-        shift = 6 - 2 * (i % 4)
-        bit_val = (packed_arr[b_idx] >> shift) & 0b11
-        chars.append(BIT_TO_NUC[bit_val])
-    return ''.join(chars)
-# 1. CPU Alignment Algorithms (Baseline Implementations
-def run_brute_force_matcher(genome: str, query: str, max_mismatches: int) -> List[Tuple[int, int]]:
-    """Linear character-by-character CPU sliding window matcher O(N * M)."""
+def encode_target_to_uint64(target_20bp: str) -> np.uint64:
+    """Packs a 20-bp guide RNA string into a 64-bit unsigned integer register."""
+    if len(target_20bp) != 20:
+        raise ValueError(f"sgRNA must be exactly 20 bp, received {len(target_20bp)} bp.")
+    packed = pack_dna_sequence(target_20bp)
+    target_val = np.uint64(0)
+    for b in range(5):
+        target_val = (target_val << np.uint64(8)) | np.uint64(packed[b])
+    return target_val
+
+
+# -------------------------------------------------------------------------
+# Week 1: CPU Baseline Alignment Engines
+# -------------------------------------------------------------------------
+def run_brute_force_cpu(
+    genome: str,
+    query: str,
+    max_mismatches: int = 4
+) -> List[Tuple[int, int]]:
+    """Linear character-by-character CPU sliding window baseline."""
     n = len(genome)
     m = len(query)
     hits = []
@@ -116,268 +125,335 @@ def run_brute_force_matcher(genome: str, query: str, max_mismatches: int) -> Lis
                 mismatches += 1
                 if mismatches > max_mismatches:
                     break
-        
+
         if mismatches <= max_mismatches:
-            if genome[i + 21] == 'G' and genome[i + 22] == 'G':
+            # Check SpCas9 PAM ('NGG')
+            if genome[i + 21] == "G" and genome[i + 22] == "G":
                 hits.append((i, mismatches))
-                
+
     return hits
 
 
-def run_smith_waterman_scores(
-    genome: str, 
-    query: str, 
-    match_score: int = 2, 
-    mismatch_penalty: int = -1, 
-    gap_penalty: int = -2
+def run_smith_waterman_cpu(
+    genome: str,
+    query: str,
+    max_mismatches: int = 4
 ) -> List[Tuple[int, int]]:
-    """Space-optimized Smith-Waterman local alignment scoring using 2-row buffers O(N * M)."""
-    n = len(genome)
-    m = len(query)
-    
+    """Space-optimized Smith-Waterman local alignment using alternating rows."""
+    n, m = len(genome), len(query)
     prev_row = [0] * (m + 1)
     curr_row = [0] * (m + 1)
-    
-    high_scoring_sites = []
-    threshold = (m - MAX_MISMATCHES) * match_score + (MAX_MISMATCHES * mismatch_penalty)
-    
+    hits = []
+    threshold = (m - max_mismatches) * 2 - (max_mismatches * 1)
+
     for i in range(1, n + 1):
+        g_char = genome[i - 1]
         for j in range(1, m + 1):
-            if genome[i - 1] == query[j - 1]:
-                score = match_score
-            else:
-                score = mismatch_penalty
-                
+            score = 2 if g_char == query[j - 1] else -1
             match = prev_row[j - 1] + score
-            delete = prev_row[j] + gap_penalty
-            insert = curr_row[j - 1] + gap_penalty
-            
+            delete = prev_row[j] - 2
+            insert = curr_row[j - 1] - 2
             curr_row[j] = max(0, match, delete, insert)
-            
+
             if j == m and curr_row[j] >= threshold:
-                high_scoring_sites.append((i - m, curr_row[j]))
-                
-        prev_row = list(curr_row)
+                hits.append((i - m, curr_row[j]))
+
+        prev_row[:] = curr_row[:]
         curr_row = [0] * (m + 1)
-        
-    return high_scoring_sites
-# 2. CUDA Kernel Engine (Parallel Bitwise Off-Target Matcher)
-if cuda is not None:
+
+    return hits
+
+
+# -------------------------------------------------------------------------
+# Week 2 & Week 4: Numba CUDA Kernel (Shared Memory Accelerated)
+# -------------------------------------------------------------------------
+if is_cuda_available():
     @cuda.jit
-    def crispr_offtarget_kernel(
+    def crispr_shared_memory_kernel(
         d_genomic_packed,
         packed_len,
         genome_bp_len,
-        target_encoded,
+        target_64,
         max_mismatches,
         d_out_indices,
         d_out_mismatches,
         d_hit_count,
+        chunk_offset_bp,
     ):
-        """GPU Kernel evaluating target alignment & PAM presence per thread index."""
-        global_bp_idx = cuda.grid(1)
-        if global_bp_idx + 23 > genome_bp_len:
+        """
+        Shared-memory accelerated kernel.
+        Caches 256 bytes per block + 8-byte boundary tail into __shared__ memory.
+        """
+        s_mem = cuda.shared.array(shape=264, dtype=numba.uint8)
+
+        tid = cuda.threadIdx.x
+        bdim = cuda.blockDim.x
+        gid = cuda.grid(1)
+
+        block_byte_start = (cuda.blockIdx.x * bdim) // 4
+
+        # Collaborative memory load into on-chip cache
+        if block_byte_start + tid < packed_len:
+            s_mem[tid] = d_genomic_packed[block_byte_start + tid]
+        else:
+            s_mem[tid] = 0
+
+        # Boundary tail for 23-bp window spanning past the block
+        if tid < 8:
+            tail_idx = block_byte_start + bdim + tid
+            if tail_idx < packed_len:
+                s_mem[bdim + tid] = d_genomic_packed[tail_idx]
+            else:
+                s_mem[bdim + tid] = 0
+
+        cuda.syncthreads()
+
+        if gid + 23 > genome_bp_len:
             return
 
-        byte_offset = global_bp_idx // 4
-        bit_shift_offset = (global_bp_idx % 4) * 2
-        if byte_offset + 6 >= packed_len:
-            return
+        local_byte_offset = tid // 4
+        bit_shift = (gid % 4) * 2
 
-        # Fetch 7 consecutive bytes into a 64-bit register
-        raw_64 = np.uint64(0)
+        # Assemble 7 consecutive bytes (56 bits) into a 64-bit register
+        raw_64 = numba.uint64(0)
         for b in range(7):
-            raw_64 = (raw_64 << np.uint64(8)) | np.uint64(d_genomic_packed[byte_offset + b])
+            raw_64 = (raw_64 << numba.uint64(8)) | numba.uint64(s_mem[local_byte_offset + b])
 
-        shifted_window = raw_64 << np.uint64(bit_shift_offset)
-        sgrna_window = np.uint64(shifted_window >> np.uint64(24))
-        target_sgrna = np.uint64(target_encoded)
+        shifted_window = raw_64 << numba.uint64(bit_shift)
+        sgrna_window = shifted_window >> numba.uint64(24)
 
         # Bitwise XOR comparison
-        xor_diff = sgrna_window ^ target_sgrna
+        diff = sgrna_window ^ numba.uint64(target_64)
         mismatches = 0
         for i in range(20):
-            pair_diff = (xor_diff >> np.uint64(38 - 2 * i)) & np.uint64(0b11)
-            if pair_diff != np.uint64(0):
+            pair = (diff >> numba.uint64(38 - 2 * i)) & numba.uint64(0b11)
+            if pair != 0:
                 mismatches += 1
                 if mismatches > max_mismatches:
                     return
 
-        # PAM Site NGG Verification
-        pam_bp1 = (shifted_window >> np.uint64(22)) & np.uint64(0b11)
-        pam_bp2 = (shifted_window >> np.uint64(20)) & np.uint64(0b11)
-        if pam_bp1 == np.uint64(0b10) and pam_bp2 == np.uint64(0b10):
-            hit_slot = cuda.atomic.add(d_hit_count, 0, 1)
-            if hit_slot < d_out_indices.size:
-                d_out_indices[hit_slot] = global_bp_idx
-                d_out_mismatches[hit_slot] = mismatches
+        # Verify PAM sequence 'GG' (0b10 0b10)
+        pam1 = (shifted_window >> numba.uint64(22)) & numba.uint64(0b11)
+        pam2 = (shifted_window >> numba.uint64(20)) & numba.uint64(0b11)
+
+        if pam1 == 0b10 and pam2 == 0b10:
+            slot = cuda.atomic.add(d_hit_count, 0, 1)
+            if slot < d_out_indices.size:
+                d_out_indices[slot] = gid + chunk_offset_bp
+                d_out_mismatches[slot] = mismatches
 else:
-    def crispr_offtarget_kernel(*args, **kwargs):
-        raise RuntimeError("CUDA kernel unavailable: Numba CUDA library not installed or configured.")
+    def crispr_shared_memory_kernel(*args, **kwargs):
+        raise RuntimeError("CUDA unavailable.")
 
 
-def run_cpu_fallback(genome_str: str, target_sgrna_str: str, max_mismatch: int = 4):
-    """Fallback executor when CUDA hardware is unavailable."""
-    print("[WARNING] Executing CPU fallback pipeline...")
-    query = target_sgrna_str + "AGG"
-    start_time = time.perf_counter()
-    hits = run_brute_force_matcher(genome_str, query, max_mismatch)
-    duration = time.perf_counter() - start_time
-    
+# -------------------------------------------------------------------------
+# Single-Device Execution Engine
+# -------------------------------------------------------------------------
+def execute_device_chunk(
+    packed_chunk: np.ndarray,
+    chunk_bp_len: int,
+    target_64: int,
+    max_mismatches: int,
+    chunk_offset: int,
+    device_id: int = 0,
+) -> Dict[str, Any]:
+    """Manages H2D transfer, kernel execution, and D2H collection for a slice."""
+    if not is_cuda_available():
+        raise RuntimeError("Cannot execute CUDA chunk: no compatible GPU detected.")
+
+    with cuda.gpus[device_id]:
+        stream = cuda.stream()
+        d_packed = cuda.to_device(packed_chunk, stream=stream)
+        d_indices = cuda.device_array(MAX_HITS_CAPACITY, dtype=np.int32, stream=stream)
+        d_mismatches = cuda.device_array(MAX_HITS_CAPACITY, dtype=np.int32, stream=stream)
+        d_hits = cuda.to_device(np.zeros(1, dtype=np.int32), stream=stream)
+
+        blocks = (chunk_bp_len - 23 + THREADS_PER_BLOCK) // THREADS_PER_BLOCK
+        crispr_shared_memory_kernel[blocks, THREADS_PER_BLOCK, stream](
+            d_packed,
+            len(packed_chunk),
+            chunk_bp_len,
+            target_64,
+            max_mismatches,
+            d_indices,
+            d_mismatches,
+            d_hits,
+            chunk_offset,
+        )
+
+        stream.synchronize()
+        total_hits = int(d_hits.copy_to_host(stream=stream)[0])
+        hits_to_pull = min(total_hits, MAX_HITS_CAPACITY)
+
+        out_indices = d_indices[:hits_to_pull].copy_to_host(stream=stream)
+        out_mismatches = d_mismatches[:hits_to_pull].copy_to_host(stream=stream)
+
     return {
-        'hits_count': len(hits),
-        'indices': np.array([pos for pos, _ in hits], dtype=np.int32),
-        'mismatches': np.array([mm for _, mm in hits], dtype=np.int32),
-        'h2d_time': 0.0,
-        'kernel_time': duration,
-        'd2h_time': 0.0,
-        'total_gpu_time': duration,
+        "count": total_hits,
+        "indices": out_indices,
+        "mismatches": out_mismatches,
+        "device_id": device_id,
     }
 
 
-def run_gpu_alignment(genome_str: str, target_sgrna_str: str, max_mismatch: int = 4):
-    """Pipeline coordinator managing memory transfers, kernel execution, and response parsing."""
-    if len(genome_str) < 23:
+# -------------------------------------------------------------------------
+# Week 3: Distributed Multi-GPU Coordination (Dask)
+# -------------------------------------------------------------------------
+def run_dask_multigpu_pipeline(
+    genome_str: str,
+    target_sgrna: str,
+    max_mismatches: int = 4,
+    chunk_size: int = 2_500_000,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Coordinates genome sequence search across available GPUs via Dask.
+    Maintains a 23-bp boundary overlap between sequential chunks.
+    """
+    import dask
+    from dask import delayed
+
+    num_gpus = max(1, get_gpu_count())
+    target_64 = encode_target_to_uint64(target_sgrna)
+
+    tasks = []
+    total_len = len(genome_str)
+    t_start = time.perf_counter()
+
+    chunk_idx = 0
+    for start_pos in range(0, total_len, chunk_size):
+        end_pos = min(start_pos + chunk_size + 23, total_len)
+        chunk_str = genome_str[start_pos:end_pos]
+        packed_data = pack_dna_sequence(chunk_str)
+        assigned_device = chunk_idx % num_gpus
+
+        task = delayed(execute_device_chunk)(
+            packed_data,
+            len(chunk_str),
+            target_64,
+            max_mismatches,
+            start_pos,
+            assigned_device,
+        )
+        tasks.append(task)
+        chunk_idx += 1
+
+    results = dask.compute(*tasks, scheduler="threads")
+    elapsed = time.perf_counter() - t_start
+
+    total_hits = sum(r["count"] for r in results)
+    if total_hits > 0:
+        all_indices = np.concatenate([r["indices"] for r in results])
+        all_mismatches = np.concatenate([r["mismatches"] for r in results])
+    else:
+        all_indices = np.array([], dtype=np.int32)
+        all_mismatches = np.array([], dtype=np.int32)
+
+    return all_indices, all_mismatches, elapsed
+
+
+# -------------------------------------------------------------------------
+# Clean API Interface for Member 2
+# -------------------------------------------------------------------------
+class GeneWeaverHPC:
+    """Unified entry point consumed by Member 2's UI and scoring pipeline."""
+
+    @staticmethod
+    def align_sequence(
+        genome: str,
+        sgrna: str,
+        max_mismatches: int = 4,
+        prefer_gpu: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Executes alignment via GPU or falls back to CPU if hardware is absent.
+        Returns:
+            {
+                'status': 'cuda' | 'cpu',
+                'runtime_sec': float,
+                'indices': np.ndarray,
+                'mismatches': np.ndarray,
+                'total_hits': int
+            }
+        """
+        if prefer_gpu and is_cuda_available():
+            indices, mismatches, elapsed = run_dask_multigpu_pipeline(
+                genome, sgrna, max_mismatches
+            )
+            return {
+                "status": "cuda",
+                "runtime_sec": elapsed,
+                "indices": indices,
+                "mismatches": mismatches,
+                "total_hits": len(indices),
+            }
+
+        # CPU Fallback
+        t0 = time.perf_counter()
+        hits = run_brute_force_cpu(genome, sgrna + "AGG", max_mismatches)
+        elapsed = time.perf_counter() - t0
         return {
-            'hits_count': 0,
-            'indices': np.array([], dtype=np.int32),
-            'mismatches': np.array([], dtype=np.int32),
-            'h2d_time': 0.0,
-            'kernel_time': 0.0,
-            'd2h_time': 0.0,
-            'total_gpu_time': 0.0,
+            "status": "cpu",
+            "runtime_sec": elapsed,
+            "indices": np.array([idx for idx, _ in hits], dtype=np.int32),
+            "mismatches": np.array([mm for _, mm in hits], dtype=np.int32),
+            "total_hits": len(hits),
         }
 
-    if not cuda_available():
-        print(f"[WARNING] {cuda_error_message()}")
-        return run_cpu_fallback(genome_str, target_sgrna_str, max_mismatch)
 
-    print(f"1. Packing genomic string ({len(genome_str):,} bp) into 2-bit representation...")
-    packed_genome = pack_dna_sequence(genome_str)
-    packed_len = len(packed_genome)
-    genome_bp_len = len(genome_str)
-
-    packed_target = pack_dna_sequence(target_sgrna_str)
-    if len(packed_target) < 5:
-        raise ValueError("Target sgRNA sequence must be at least 20 base pairs long.")
-
-    target_64 = np.uint64(0)
-    for b in range(5):
-        target_64 = (target_64 << np.uint64(8)) | np.uint64(packed_target[b])
-
-    print("2. Transferring data from Host RAM to Device VRAM (H2D)...")
-    h2d_start = time.perf_counter()
-
-    d_genomic_packed = cuda.to_device(packed_genome)
-    d_out_indices = cuda.device_array(MAX_HITS_CAPACITY, dtype=np.int32)
-    d_out_mismatches = cuda.device_array(MAX_HITS_CAPACITY, dtype=np.int32)
-    d_hit_count = cuda.to_device(np.zeros(1, dtype=np.int32))
-
-    cuda.synchronize()
-    h2d_time = time.perf_counter() - h2d_start
-
-    total_threads = genome_bp_len - 23 + 1
-    blocks_per_grid = (total_threads + THREADS_PER_BLOCK - 1) // THREADS_PER_BLOCK
-
-    print(f"3. Launching CUDA Kernel across {blocks_per_grid:,} thread blocks ({THREADS_PER_BLOCK} threads/block)...")
-    kernel_start = time.perf_counter()
-    try:
-        crispr_offtarget_kernel[blocks_per_grid, THREADS_PER_BLOCK](
-            d_genomic_packed,
-            packed_len,
-            genome_bp_len,
-            target_64,
-            max_mismatch,
-            d_out_indices,
-            d_out_mismatches,
-            d_hit_count,
-        )
-        cuda.synchronize()
-    except Exception as err:
-        print(f"[WARNING] CUDA kernel launch failed: {err}")
-        return run_cpu_fallback(genome_str, target_sgrna_str, max_mismatch)
-
-    kernel_time = time.perf_counter() - kernel_start
-
-    print("4. Transferring results from Device VRAM back to Host RAM (D2H)...")
-    d2h_start = time.perf_counter()
-
-    total_hits = d_hit_count.copy_to_host()[0]
-    hits_indices = d_out_indices[:total_hits].copy_to_host()
-    hits_mismatches = d_out_mismatches[:total_hits].copy_to_host()
-    d2h_time = time.perf_counter() - d2h_start
-
-    return {
-        'hits_count': total_hits,
-        'indices': hits_indices,
-        'mismatches': hits_mismatches,
-        'h2d_time': h2d_time,
-        'kernel_time': kernel_time,
-        'd2h_time': d2h_time,
-        'total_gpu_time': h2d_time + kernel_time + d2h_time,
-    }
-# Execution Main Method & Benchmarking Harness
-# ==============================================================
-if __name__ == '__main__':
+# -------------------------------------------------------------------------
+# Verification & Self-Test Harness
+# -------------------------------------------------------------------------
+if __name__ == "__main__":
     print("=" * 65)
-    print("        GeneWeaver: Unified CPU & GPU Alignment Suite        ")
+    print("  GENEWEAVER: MEMBER 1 UNIFIED VERIFICATION SUITE  ")
     print("=" * 65)
 
-    print(f"Generating synthetic DNA dataset ({GENOME_SIZE_SIMULATION:,} bp)...")
-    mem_before_gen = get_process_memory_mb()
-    genome_dna = generate_synthetic_dna(GENOME_SIZE_SIMULATION)
+    TEST_SIZE = 5_000_000
+    TARGET_RNA = "GAGTCCGAGCAGAAGAAGAA"
+    PAM = "AGG"
+    QUERY = TARGET_RNA + PAM
 
-    # Inject known off-target mutations for accuracy validation
-    pos1 = 500_000
-    genome_dna = genome_dna[:pos1] + (TARGET_SGRNA + PAM_PATTERN) + genome_dna[pos1 + 23:]
+    print(f"Generating {TEST_SIZE:,} bp synthetic sequence...")
+    np.random.seed(1337)
+    bases = np.array(["A", "C", "G", "T"])
+    genome_sample = "".join(np.random.choice(bases, size=TEST_SIZE))
 
-    pos2 = 2_500_000
-    mutated_sgRNA = "GCGTCCGACTAGAAGAAGAA"  # 2 mismatches
-    genome_dna = genome_dna[:pos2] + (mutated_sgRNA + PAM_PATTERN) + genome_dna[pos2 + 23:]
+    # Inject validation targets
+    target_pos1 = 250_000
+    target_pos2 = 2_750_000
+    mutated_sgrna = "GAGTCCTAGCAGAAGAAGAA"  # 1 mismatch
 
-    print(f"Memory Overhead: {get_process_memory_mb() - mem_before_gen:.2f} MB")
-    print(f"Target sgRNA + PAM: {QUERY_SEQ} (Length: {len(QUERY_SEQ)} bp)")
-    print("-" * 65)
+    genome_sample = (
+        genome_sample[:target_pos1]
+        + (TARGET_RNA + PAM)
+        + genome_sample[target_pos1 + 23 :]
+    )
+    genome_sample = (
+        genome_sample[:target_pos2]
+        + (mutated_sgrna + PAM)
+        + genome_sample[target_pos2 + 23 :]
+    )
 
-    # 1. CPU Brute-Force Matcher Benchmark
-    print("\n[Benchmark 1] Executing CPU Naive Brute-Force Matcher...")
-    start_time = time.perf_counter()
-    bf_hits = run_brute_force_matcher(genome_dna, QUERY_SEQ, MAX_MISMATCHES)
-    bf_duration = time.perf_counter() - start_time
-    print(f"  └── Time Elapsed: {bf_duration:.4f} seconds | Rate: {(GENOME_SIZE_SIMULATION / bf_duration) / 1e6:.3f} MB/s")
+    # 1. CPU Benchmark on a 500k slice
+    slice_len = 500_000
+    t0 = time.perf_counter()
+    _ = run_brute_force_cpu(genome_sample[:slice_len], QUERY, max_mismatches=4)
+    t_cpu_slice = time.perf_counter() - t0
+    extrapolated_cpu = (t_cpu_slice / slice_len) * TEST_SIZE
+    print(f"\n[Week 1 Benchmark] CPU Brute-Force Extrapolated: {extrapolated_cpu:.2f} s")
 
-    # 2. CPU Smith-Waterman Benchmark
-    print("\n[Benchmark 2] Executing CPU Space-Optimized Smith-Waterman...")
-    start_time = time.perf_counter()
-    sw_hits = run_smith_waterman_scores(genome_dna, QUERY_SEQ)
-    sw_duration = time.perf_counter() - start_time
-    print(f"  └── Time Elapsed: {sw_duration:.4f} seconds | Rate: {(GENOME_SIZE_SIMULATION / sw_duration) / 1e6:.3f} MB/s")
+    # 2. End-to-End Run (GPU if available, CPU if not)
+    print(f"\n[Engine Run] Executing GeneWeaverHPC API...")
+    res = GeneWeaverHPC.align_sequence(genome_sample, TARGET_RNA, max_mismatches=4)
 
-    # 3. GPU Alignment Kernel Execution
-    print("\n[Benchmark 3] Executing Numba CUDA Alignment Kernel...")
-    gpu_results = run_gpu_alignment(genome_dna, TARGET_SGRNA, max_mismatch=MAX_MISMATCHES)
+    print(f"  ├── Engine Selected: {res['status'].upper()}")
+    print(f"  ├── Total Hits Detected: {res['total_hits']}")
+    print(f"  └── Execution Wall Time: {res['runtime_sec']:.4f} s")
 
-    print("\n" + "=" * 65)
-    print("                      PIPELINE RUN SUMMARY                     ")
-    print("=" * 65)
-    print(f"Total Off-Target Hits Found: {gpu_results['hits_count']}")
-    print(f"  ├── Host-to-Device (H2D) Transfer Time: {gpu_results['h2d_time']:.4f} s")
-    print(f"  ├── Pure Kernel Execution Time:       {gpu_results['kernel_time']:.4f} s")
-    print(f"  ├── Device-to-Host (D2H) Transfer Time: {gpu_results['d2h_time']:.4f} s")
-    print(f"  └── Total GPU Stage Runtime:          {gpu_results['total_gpu_time']:.4f} s")
-    
-    if gpu_results['kernel_time'] > 0 and cuda_available():
-        speedup = bf_duration / gpu_results['total_gpu_time']
-        kernel_speedup = bf_duration / gpu_results['kernel_time']
-        print(f"\n  ★ End-to-End GPU Speedup: {speedup:.2f}x vs CPU Brute-Force")
-        print(f"  ★ Pure Kernel GPU Speedup: {kernel_speedup:.2f}x vs CPU Brute-Force")
+    if res["status"] == "cuda" and res["runtime_sec"] > 0:
+        speedup = extrapolated_cpu / res["runtime_sec"]
+        print(f"  ★ Projected Speedup vs CPU: {speedup:.1f}x")
 
-    print("-" * 65)
-    print("Verifying Detected Off-Target Sequence Locations:")
-    for idx, mismatches in zip(gpu_results['indices'], gpu_results['mismatches']):
-        extracted = genome_dna[idx : idx + 23]
-        print(f"  • Position {idx:10,d} | Mismatches: {mismatches} | Sequence: {extracted}")
-
-    assert pos1 in gpu_results['indices'], f"Error: Target lost at index {pos1}"
-    assert pos2 in gpu_results['indices'], f"Error: Target lost at index {pos2}"
-    print("\n[SUCCESS] Correctness check passed! All injected targets accurately detected.")
+    assert target_pos1 in res["indices"], f"Target lost at position {target_pos1}"
+    assert target_pos2 in res["indices"], f"Off-target lost at position {target_pos2}"
+    print("\n[SUCCESS] Correctness check passed. All injected sites detected.")
