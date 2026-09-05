@@ -401,7 +401,7 @@ class GeneWeaverHPC:
 
 
 # -----------------------------------------------------------------------
-# Verification & Self-Test Harness
+# Verification & Self-Test Harnes
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
     print("=" * 65)
