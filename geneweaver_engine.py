@@ -106,7 +106,7 @@ def encode_target_to_uint64(target_20bp: str) -> np.uint64:
 
 
 # -------------------------------------------------------------------------
-# Week 1: CPU Baseline Alignment Engines
+# Week 1: CPU Baseline Alignment Engine
 # -------------------------------------------------------------------------
 def run_brute_force_cpu(
     genome: str,
