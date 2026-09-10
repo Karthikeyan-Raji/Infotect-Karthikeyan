@@ -1,4 +1,4 @@
-# ==============================================================================
+# =============================================================================
 # ChronosMatch: Zero-Copy High-Frequency Trading Engine
 # Module: engine/__init__.py
 # Role:Person 1 (Low-Latency Core & Memory Architect)
