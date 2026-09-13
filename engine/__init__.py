@@ -33,10 +33,10 @@ except ImportError:
     CYTHON_ACCELERATED = False
 
 if not CYTHON_ACCELERATED:
-    # --------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Pure-Python / Ctypes Compatible Fallback Implementation
     # Exact same 32-byte binary protocol, zero-copy layout, and nogil-style LOB
-    # --------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     class SPSCBufferWriter:
         def __init__(self, file_path: str, capacity: int = 1048576):
             self.file_path = file_path
