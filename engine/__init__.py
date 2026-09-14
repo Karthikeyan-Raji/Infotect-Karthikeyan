@@ -1,10 +1,10 @@
-# ============================================================================
+# ===========================================================================
 # ChronosMatch: Zero-Copy High-Frequency Trading Engine
 # Module: engine/__init__.py
 # Role:Person 1 (Low-Latency Core & Memory Architect)
 # Description:Engine module loader with seamless Cython compiled speedup and
 #              pure-Python/ctypes fallback for zero-dependency execution.
-# ============================================================================
+# ===========================================================================
 
 import struct
 import time
